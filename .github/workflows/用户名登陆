@@ -1,0 +1,39 @@
+name: FreeMCHost Auto Renew
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'  # 已为你开启两小时一次的自动续期
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install seleniumbase aiohttp PyNaCl
+          seleniumbase install chromedriver
+          sudo apt-get update
+          # 移除了 scrot，保留核心物理模拟工具 xdotool 和 xvfb
+          sudo apt-get install -y xvfb xdotool
+
+      - name: Run
+        env:
+          ACCOUNTS: ${{ secrets.FREEMCHOST_ACCOUNTS }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GS_START_WINDOW_SIZE: "1920,1080"
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python scripts/freemchost_renew.py
