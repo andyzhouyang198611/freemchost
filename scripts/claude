@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# scripts/freemchost_renew.py
+
+import os
+import time
+import asyncio
+import aiohttp
+import base64
+import random
+import re
+import subprocess
+import json
+
+from seleniumbase import SB
+
+try:
+    from nacl import encoding, public
+    NACL_AVAILABLE = True
+except ImportError:
+    NACL_AVAILABLE = False
+
+LOGIN_URL = "https://freemchost.com/auth"
+BASE_URL = "https://freemchost.com/renew?id="
+DOMAIN = "freemchost.com"
+
+
+def mask_sensitive(text, show_chars=3):
+    if not text:
+        return "***"
+    text = str(text)
+    if len(text) <= show_chars * 2:
+        return "*" * len(text)
+    return text[:show_chars] + "*" * (len(text) - show_chars * 2) + text[-show_chars:]
+
+
+def mask_email(email):
+    if not email or "@" not in email:
+        return mask_sensitive(email)
+    local, domain = email.rsplit("@", 1)
+    if len(local) <= 2:
+        masked_local = "*" * len(local)
+    else:
+        masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
+    return masked_local + "@" + domain
+
+
+def mask_server_id(server_id):
+    if not server_id:
+        return "***"
+    if len(server_id) <= 4:
+        return "*" * len(server_id)
+    return server_id[:2] + "*" * (len(server_id) - 4) + server_id[-2:]
+
+
+def mask_url(url):
+    if not url:
+        return "***"
+    if "?id=" in url:
+        parts = url.split("?id=")
+        if len(parts) == 2:
+            return parts[0] + "?id=" + mask_server_id(parts[1])
+    return url
+
+
+def parse_accounts():
+    accounts_str = os.environ.get("ACCOUNTS", "").strip()
+    if not accounts_str:
+        print("ERROR: ACCOUNTS not set")
+        return []
+    try:
+        accounts = json.loads(accounts_str)
+        if not isinstance(accounts, list):
+            print("ERROR: ACCOUNTS must be a list")
+            return []
+        valid_accounts = []
+        for i, acc in enumerate(accounts):
+            if not isinstance(acc, dict):
+                continue
+            missing = []
+            if not acc.get("id"):
+                missing.append("id")
+            if not acc.get("email"):
+                missing.append("email")
+            if not acc.get("password"):
+                missing.append("password")
+            if missing:
+                print("[!] Account " + str(i+1) + " missing: " + ", ".join(missing))
+                continue
+            valid_accounts.append(acc)
+        print("[+] Found " + str(len(valid_accounts)) + " valid accounts")
+        return valid_accounts
+    except json.JSONDecodeError as e:
+        print("ERROR: JSON parse failed: " + str(e))
+        return []
+
+
+def build_renew_url(server_id):
+    if not server_id:
+        return None
+    server_id = server_id.strip()
+    return server_id if server_id.startswith("http") else BASE_URL + server_id
+
+
+def get_remaining_seconds(sb):
+    try:
+        text = sb.execute_script(
+            "var el = document.getElementById('session-remaining');"
+            "if (el) return el.innerText.trim();"
+            "return null;"
+        )
+        if not text:
+            return None
+        match = re.search(r'(\d+)min\s+(\d+)s', text)
+        if match:
+            return int(match.group(1)) * 60 + int(match.group(2))
+        match_h = re.search(r'(\d+)h\s+(\d+)min', text)
+        if match_h:
+            return int(match_h.group(1)) * 3600 + int(match_h.group(2)) * 60
+        return None
+    except:
+        return None
+
+
+def format_remaining(seconds):
+    if seconds is None:
+        return "unknown"
+    if seconds <= 0:
+        return "expired"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return str(h).zfill(2) + ":" + str(m).zfill(2) + ":" + str(s).zfill(2)
+    return str(m).zfill(2) + ":" + str(s).zfill(2)
+
+
+EXPAND_JS = """
+(function() {
+    var container = document.querySelector('.cf-turnstile');
+    if (!container) return 'no container';
+    var el = container;
+    for (var i = 0; i < 10; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        var style = window.getComputedStyle(el);
+        if (style.overflow === 'hidden') el.style.overflow = 'visible';
+    }
+    container.style.minWidth = '300px';
+    container.style.minHeight = '65px';
+    container.style.display = 'block';
+    container.style.visibility = 'visible';
+    return 'done';
+})();
+"""
+
+
+def scroll_to_turnstile(sb):
+    try:
+        sb.execute_script(
+            "var container = document.querySelector('.cf-turnstile');"
+            "if (container) container.scrollIntoView({behavior: 'instant', block: 'center'});"
+        )
+        time.sleep(0.5)
+    except:
+        pass
+
+
+def get_cf_turnstile_coords(sb):
+    try:
+        result = sb.execute_script("""
+            var container = document.querySelector('.cf-turnstile');
+            if (container) {
+                var rect = container.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                    var frameLeft = rect.x + (rect.width - 300) / 2;
+                    return {
+                        x: rect.x, y: rect.y,
+                        width: rect.width, height: rect.height,
+                        click_x: Math.round(frameLeft + 25),
+                        click_y: Math.round(rect.y + rect.height / 2)
+                    };
+                }
+            }
+            return null;
+        """)
+        if result:
+            print("[*] coords raw: x=" + str(result['x']) + " frameLeft=" + str(result['x'] + (result['width']-300)/2) + " click_x=" + str(result['click_x']))
+        return result
+    except:
+        return None
+
+def activate_browser_window():
+    try:
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        window_ids = result.stdout.strip().split('\n')
+        if window_ids and window_ids[0]:
+            subprocess.run(
+                ["xdotool", "windowactivate", window_ids[0]],
+                timeout=2, stderr=subprocess.DEVNULL
+            )
+            time.sleep(0.2)
+            return True
+    except:
+        pass
+    return False
+
+
+def xdotool_click(x, y):
+    x, y = int(x), int(y)
+    activate_browser_window()
+    try:
+        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+        return True
+    except:
+        pass
+    try:
+        os.system("xdotool mousemove " + str(x) + " " + str(y) + " click 1 2>/dev/null")
+        return True
+    except:
+        return False
+
+def click_cf_turnstile(sb):
+    scroll_to_turnstile(sb)
+    time.sleep(0.5)
+
+    try:
+        info = sb.execute_script("""
+            var container = document.querySelector('.cf-turnstile');
+            if (!container) return null;
+            var rect = container.getBoundingClientRect();
+            return {
+                screenX: window.screenX || 0,
+                screenY: window.screenY || 0,
+                outerHeight: window.outerHeight,
+                innerHeight: window.innerHeight,
+                innerWidth: window.innerWidth,
+                cf_x: rect.x,
+                cf_y: rect.y,
+                cf_w: rect.width,
+                cf_h: rect.height
+            };
+        """)
+
+        if not info:
+            print("[!] Cannot get page info")
+            return False
+
+        bar = info["outerHeight"] - info["innerHeight"]
+        cf_frame_left = info["cf_x"] + (info["cf_w"] - 300) / 2
+        page_x = cf_frame_left + 25
+        page_y = info["cf_y"] + info["cf_h"] / 2
+
+        abs_x = page_x + info["screenX"]
+        abs_y = page_y + info["screenY"] + bar
+
+        print("[*] CF container: x=" + str(int(info["cf_x"])) + " y=" + str(int(info["cf_y"])) + " w=" + str(int(info["cf_w"])) + " h=" + str(int(info["cf_h"])))
+        print("[*] CF frame_left=" + str(int(cf_frame_left)) + " page_click=(" + str(int(page_x)) + "," + str(int(page_y)) + ")")
+        print("[*] screenX=" + str(info["screenX"]) + " screenY=" + str(info["screenY"]) + " bar=" + str(bar))
+        print("[*] CF click at: (" + str(int(abs_x)) + ", " + str(int(abs_y)) + ")")
+
+        # ✅ 先移动鼠标到目标位置，截图确认位置
+        activate_browser_window()
+        subprocess.run(["xdotool", "mousemove", str(int(abs_x)), str(int(abs_y))], timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+
+        # ✅ 截图显示鼠标位置（用 scrot 截图包含鼠标光标）
+        subprocess.run(["scrot", "-p", "mouse_position.png"], timeout=3, stderr=subprocess.DEVNULL)
+        print("[*] mouse position screenshot saved")
+
+        # 点击
+        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+        return True
+
+    except Exception as e:
+        print("[!] Error: " + str(e))
+        return False
+
+def is_btn_enabled(sb, selector):
+    try:
+        return sb.execute_script(
+            "var btn = document.querySelector('" + selector + "');"
+            "if (!btn) return false;"
+            "return !btn.disabled;"
+        )
+    except:
+        return False
+
+
+def handle_cf_for_btn(sb, btn_selector, screenshot_prefix="", label=""):
+    print("[CF:" + label + "] waiting for auto verify...")
+
+    # 先等自动验证（最多15秒）
+    for i in range(15):
+        if is_btn_enabled(sb, btn_selector):
+            print("[CF:" + label + "] auto verified! button enabled")
+            return True
+        if i % 5 == 0:
+            print("[CF:" + label + "] waiting... " + str(i) + "s")
+        time.sleep(1)
+
+    # 自动验证失败，手动点击
+    print("[CF:" + label + "] auto verify failed, trying manual click...")
+    for attempt in range(6):
+        print("[CF:" + label + "] attempt " + str(attempt + 1) + "/6")
+
+        if is_btn_enabled(sb, btn_selector):
+            print("[CF:" + label + "] button enabled!")
+            return True
+
+        click_cf_turnstile(sb)
+
+        for _ in range(10):
+            time.sleep(0.5)
+            if is_btn_enabled(sb, btn_selector):
+                print("[CF:" + label + "] button enabled!")
+                return True
+
+        if screenshot_prefix:
+            sb.save_screenshot(screenshot_prefix + "_" + label + "_cf_attempt_" + str(attempt) + ".png")
+
+    print("[CF:" + label + "] failed")
+    return False
+
+
+def login(sb, email, password, screenshot_prefix=""):
+    print("[Login] opening login page...")
+    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=5)
+    time.sleep(4)
+
+    current_url = sb.get_current_url()
+    print("[Login] url: " + current_url)
+
+    if "/auth" not in current_url:
+        print("[Login] already logged in")
+        return True
+
+    print("[Login] filling form...")
+    try:
+        sb.type('input[type="email"]', email)
+        time.sleep(0.5)
+        sb.type('input[type="password"]', password)
+        time.sleep(0.5)
+        print("[Login] form filled")
+    except Exception as e:
+        print("[Login] fill error: " + str(e))
+        return False
+
+    if screenshot_prefix:
+        sb.save_screenshot(screenshot_prefix + "_login_before_cf.png")
+
+    # 处理登录页CF验证
+    handle_cf_for_btn(sb, 'button[type="submit"]', screenshot_prefix=screenshot_prefix, label="login")
+
+    print("[Login] clicking submit...")
+    for i in range(20):
+        try:
+            if is_btn_enabled(sb, 'button[type="submit"]'):
+                sb.execute_script(
+                    "var btn = document.querySelector('button[type=\"submit\"]');"
+                    "if (btn) btn.click();"
+                )
+                print("[Login] submit clicked!")
+                break
+        except:
+            pass
+        if i % 5 == 0:
+            print("[Login] waiting submit... " + str(i) + "s")
+        time.sleep(1)
+
+    print("[Login] waiting for redirect...")
+    time.sleep(5)
+
+    current_url = sb.get_current_url()
+    print("[Login] after login url: " + current_url)
+
+    if "/auth" not in current_url:
+        print("[Login] success!")
+        if screenshot_prefix:
+            sb.save_screenshot(screenshot_prefix + "_login_success.png")
+        return True
+    else:
+        print("[Login] failed")
+        if screenshot_prefix:
+            sb.save_screenshot(screenshot_prefix + "_login_failed.png")
+        return False
+
+
+def close_discord_modal(sb):
+    try:
+        present = sb.execute_script(
+            "return document.querySelector('.dismissModal') !== null;"
+        )
+        if present:
+            print("[Modal] closing Discord modal...")
+            sb.execute_script("document.querySelector('.dismissModal').click();")
+            time.sleep(1)
+            print("[Modal] closed")
+        else:
+            print("[Modal] no modal")
+    except Exception as e:
+        print("[Modal] error: " + str(e))
+
+
+def check_renew_success(sb):
+    try:
+        return sb.execute_script(
+            "var fb = document.getElementById('renewFeedback');"
+            "if (fb && fb.innerText) {"
+            "    var t = fb.innerText.toLowerCase();"
+            "    return t.includes('success') || t.includes('renewed');"
+            "}"
+            "var body = document.body.innerText || '';"
+            "return body.includes('renewed successfully') || body.includes('Session renewed');"
+        )
+    except:
+        return False
+
+
+def do_renew(sb, renew_url, screenshot_prefix=""):
+    print("[Renew] opening renew page...")
+    sb.uc_open_with_reconnect(renew_url, reconnect_time=5)
+
+    print("[Renew] waiting for page fully loaded...")
+    for i in range(20):
+        if sb.is_element_present('#renewSessionBtn'):
+            print("[Renew] page loaded!")
+            break
+        if i % 5 == 0:
+            print("[Renew] waiting page... " + str(i) + "s")
+        time.sleep(1)
+
+    current_url = sb.get_current_url()
+    print("[Renew] url: " + current_url)
+
+    if "/auth" in current_url:
+        print("[Renew] redirected to login")
+        return {"status": "error", "message": "login expired"}
+
+    has_btn = sb.is_element_present('#renewSessionBtn')
+    has_remaining = sb.is_element_present('#session-remaining')
+    print("[Renew] has_btn=" + str(has_btn) + " has_remaining=" + str(has_remaining))
+
+    if not has_btn:
+        sb.save_screenshot(screenshot_prefix + "_no_btn.png")
+        return {"status": "error", "message": "renew button not found"}
+
+    # 滚动到 Renew 按钮
+    sb.execute_script(
+        "var btn = document.getElementById('renewSessionBtn');"
+        "if (btn) btn.scrollIntoView({behavior: 'instant', block: 'center'});"
+    )
+    time.sleep(1)
+
+    # 记录续期前剩余时间
+    remaining_before = get_remaining_seconds(sb)
+    print("[Renew] remaining before: " + format_remaining(remaining_before))
+
+    # 关闭 Discord 弹窗
+    print("[Renew] checking Discord modal...")
+    time.sleep(2)
+    close_discord_modal(sb)
+
+    # 截图
+    sb.save_screenshot(screenshot_prefix + "_renew_before.png")
+
+    # 处理 Renew 页面CF验证
+    handle_cf_for_btn(sb, '#renewSessionBtn', screenshot_prefix=screenshot_prefix, label="renew")
+
+    # 最终等待按钮可用
+    print("[Renew] final wait for button...")
+    ready = False
+    for i in range(10):
+        if is_btn_enabled(sb, '#renewSessionBtn'):
+            ready = True
+            print("[Renew] button enabled!")
+            break
+        if i % 5 == 0:
+            print("[Renew] waiting... " + str(i) + "s")
+        time.sleep(1)
+
+    if not ready:
+        sb.save_screenshot(screenshot_prefix + "_btn_not_ready.png")
+        return {"status": "error", "message": "button not enabled"}
+
+    time.sleep(random.uniform(0.5, 1.5))
+    print("[Renew] clicking renew button...")
+    sb.execute_script("document.getElementById('renewSessionBtn').click();")
+    print("[Renew] clicked!")
+
+    print("[Renew] waiting for result...")
+    screenshot_name = screenshot_prefix + "_result.png"
+    for i in range(30):
+        time.sleep(1)
+        if check_renew_success(sb):
+            print("[Renew] success!")
+            sb.save_screenshot(screenshot_name)
+            return {"status": "success", "screenshot": screenshot_name}
+        remaining_now = get_remaining_seconds(sb)
+        if remaining_now and remaining_before and remaining_now > remaining_before + 60:
+            print("[Renew] success by time increase!")
+            sb.save_screenshot(screenshot_name)
+            return {"status": "success", "screenshot": screenshot_name}
+        if i % 5 == 0:
+            print("[Renew] waiting... " + str(i) + "s")
+
+    remaining_final = get_remaining_seconds(sb)
+    if remaining_final and remaining_before and remaining_final > remaining_before + 60:
+        print("[Renew] success after timeout!")
+        sb.save_screenshot(screenshot_name)
+        return {"status": "success", "screenshot": screenshot_name}
+
+    print("[Renew] timeout")
+    sb.save_screenshot(screenshot_name)
+    return {"status": "timeout", "screenshot": screenshot_name}
+
+
+async def tg_notify(message):
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    if not token or not chat_id:
+        print("[TG] not configured, skip")
+        return
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(
+                "https://api.telegram.org/bot" + token + "/sendMessage",
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+            )
+        except Exception as e:
+            print("[TG] send failed: " + str(e))
+
+
+async def tg_notify_photo(photo_path, caption=""):
+    token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    if not token or not chat_id or not os.path.exists(photo_path):
+        return
+    async with aiohttp.ClientSession() as session:
+        try:
+            with open(photo_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("chat_id", chat_id)
+                data.add_field("photo", f, filename=os.path.basename(photo_path))
+                data.add_field("caption", caption)
+                data.add_field("parse_mode", "HTML")
+                await session.post(
+                    "https://api.telegram.org/bot" + token + "/sendPhoto",
+                    data=data
+                )
+        except Exception as e:
+            print("[TG] photo failed: " + str(e))
+
+
+def sync_tg_notify(message):
+    asyncio.run(tg_notify(message))
+
+
+def sync_tg_notify_photo(photo_path, caption=""):
+    asyncio.run(tg_notify_photo(photo_path, caption))
+
+
+def encrypt_secret(public_key, secret_value):
+    pk = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
+    sealed_box = public.SealedBox(pk)
+    encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
+    return base64.b64encode(encrypted).decode("utf-8")
+
+
+async def update_github_secret(secret_name, secret_value):
+    repo_token = os.environ.get("REPO_TOKEN", "").strip()
+    repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repo_token or not repository or not NACL_AVAILABLE:
+        return False
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": "Bearer " + repo_token,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with aiohttp.ClientSession() as session:
+        try:
+            pk_url = "https://api.github.com/repos/" + repository + "/actions/secrets/public-key"
+            async with session.get(pk_url, headers=headers) as resp:
+                if resp.status != 200:
+                    return False
+                pk_data = await resp.json()
+            encrypted_value = encrypt_secret(pk_data["key"], secret_value)
+            secret_url = "https://api.github.com/repos/" + repository + "/actions/secrets/" + secret_name
+            async with session.put(secret_url, headers=headers, json={
+                "encrypted_value": encrypted_value,
+                "key_id": pk_data["key_id"]
+            }) as resp:
+                return resp.status in (201, 204)
+        except:
+            return False
+
+
+def process_single_account(sb, account, account_index):
+    remark = account.get("remark", "account" + str(account_index + 1))
+    server_id = account.get("id", "").strip()
+    email = account.get("email", "").strip()
+    password = account.get("password", "").strip()
+    display_name = mask_email(remark) if "@" in remark else remark
+
+    result = {
+        "remark": remark,
+        "display_name": display_name,
+        "server_id": server_id,
+        "status": "unknown",
+        "remaining_after": None,
+        "message": "",
+        "screenshot": None,
+    }
+
+    print("=" * 60)
+    print("Account [" + str(account_index + 1) + "]: " + display_name)
+    print("=" * 60)
+
+    if not server_id or not email or not password:
+        result["status"] = "error"
+        result["message"] = "missing id/email/password"
+        return result
+
+    renew_url = build_renew_url(server_id)
+    screenshot_prefix = "account_" + str(account_index + 1)
+
+    print("[*] email: " + mask_email(email))
+    print("[*] server_id: " + mask_server_id(server_id))
+    print("[*] renew_url: " + mask_url(renew_url))
+
+    try:
+        print("[Step1] Login...")
+        login_ok = login(sb, email, password, screenshot_prefix=screenshot_prefix)
+        if not login_ok:
+            result["status"] = "error"
+            result["message"] = "login failed"
+            return result
+
+        print("[Step2] Renew...")
+        renew_result = do_renew(sb, renew_url, screenshot_prefix=screenshot_prefix)
+        result["screenshot"] = renew_result.get("screenshot")
+
+        time.sleep(3)
+        remaining_after = get_remaining_seconds(sb)
+        result["remaining_after"] = remaining_after
+        print("[*] remaining after: " + format_remaining(remaining_after))
+
+        if renew_result["status"] == "success":
+            result["status"] = "success"
+            result["message"] = "renew success"
+        else:
+            result["status"] = renew_result["status"]
+            result["message"] = renew_result.get("message", "unknown")
+
+    except Exception as e:
+        import traceback
+        print("[!] exception: " + repr(e))
+        traceback.print_exc()
+        result["status"] = "error"
+        result["message"] = str(e)[:100]
+
+    return result
+
+
+def send_summary_report(results):
+    success_count = sum(1 for r in results if r["status"] == "success")
+    error_count = len(results) - success_count
+
+    lines = [
+        "FreeMCHost Renew Report",
+        "",
+        "Total: " + str(len(results)),
+        "Success: " + str(success_count) + "  Failed: " + str(error_count),
+        "",
+        "------------------------"
+    ]
+
+    for i, r in enumerate(results):
+        icon = {"success": "OK", "error": "FAIL", "timeout": "TIMEOUT"}.get(r["status"], "?")
+        remark = r.get("remark", "account" + str(i + 1))
+        server_id = r.get("server_id", "")
+        lines.append("")
+        lines.append(icon + " " + remark)
+        if server_id:
+            lines.append("  Server: " + mask_server_id(server_id))
+        if r["status"] == "success":
+            lines.append("  Remaining: " + format_remaining(r.get("remaining_after")))
+        else:
+            lines.append("  Error: " + r.get("message", "unknown"))
+
+    message = "\n".join(lines)
+
+    screenshot = None
+    for r in results:
+        if r.get("screenshot") and os.path.exists(r["screenshot"]):
+            screenshot = r["screenshot"]
+            break
+
+    if screenshot:
+        sync_tg_notify_photo(screenshot, message)
+    else:
+        sync_tg_notify(message)
+
+
+def main():
+    accounts = parse_accounts()
+    if not accounts:
+        sync_tg_notify("FreeMCHost ERROR: ACCOUNTS not configured")
+        return
+
+    print("=" * 60)
+    print("FreeMCHost Auto Renew")
+    print("Accounts: " + str(len(accounts)))
+    print("=" * 60)
+
+    results = []
+
+    try:
+        with SB(
+            uc=True,
+            test=True,
+            locale="zh-CN",
+            headless=False,
+            window_size="1920,1080",
+            chromium_arg="--disable-dev-shm-usage,--no-sandbox,--disable-gpu,--disable-software-rasterizer,--disable-background-timer-throttling"
+        ) as sb:
+            print("[*] browser started")
+
+            for i, account in enumerate(accounts):
+                result = process_single_account(sb, account, i)
+                results.append(result)
+
+                if i < len(accounts) - 1:
+                    wait_time = random.randint(5, 10)
+                    print("[*] waiting " + str(wait_time) + "s...")
+                    time.sleep(wait_time)
+
+    except Exception as e:
+        import traceback
+        print("[!] browser error: " + repr(e))
+        traceback.print_exc()
+        if results:
+            send_summary_report(results)
+        else:
+            sync_tg_notify("FreeMCHost ERROR: browser failed\n" + repr(e))
+        return
+
+    send_summary_report(results)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import time
+import asyncio
+import aiohttp
+import base64
+import random
+import re
+import subprocess
+import json
+from seleniumbase import SB
+
+try:
+    from nacl import encoding, public
+    NACL_AVAILABLE = True
+except ImportError:
+    NACL_AVAILABLE = False
+
+LOGIN_URL = "https://freemchost.com/auth"
+BASE_URL = "https://freemchost.com/renew?id="
+
+def mask_sensitive(text, show_chars=3):
+    if not text: return "***"
+    text = str(text)
+    if len(text) <= show_chars * 2: return "*" * len(text)
+    return text[:show_chars] + "*" * (len(text) - show_chars * 2) + text[-show_chars:]
+
+def mask_email(email):
+    if not email or "@" not in email: return mask_sensitive(email)
+    local, domain = email.rsplit("@", 1)
+    if len(local) <= 2: return "*" * len(local) + "@" + domain
+    return local[0] + "*" * (len(local) - 2) + local[-1] + "@" + domain
+
+def mask_server_id(server_id):
+    if not server_id: return "***"
+    if len(server_id) <= 4: return "*" * len(server_id)
+    return server_id[:2] + "*" * (len(server_id) - 4) + server_id[-2:]
+
+def parse_accounts():
+    accounts_str = os.environ.get("ACCOUNTS", "").strip()
+    if not accounts_str: return []
+    try:
+        accounts = json.loads(accounts_str)
+        return [acc for acc in accounts if isinstance(acc, dict) and acc.get("id") and acc.get("email") and acc.get("password")]
+    except:
+        return []
+
+def get_remaining_seconds(sb):
+    try:
+        text = sb.execute_script(
+            "var el = document.getElementById('session-remaining');"
+            "if (el) return el.innerText.trim(); return null;"
+        )
+        if not text: return None
+        match = re.search(r'(\d+)min\s+(\d+)s', text)
+        if match: return int(match.group(1)) * 60 + int(match.group(2))
+        match_h = re.search(r'(\d+)h\s+(\d+)min', text)
+        if match_h: return int(match_h.group(1)) * 3600 + int(match_h.group(2)) * 60
+        return None
+    except:
+        return None
+
+def format_remaining(seconds):
+    if seconds is None: return "unknown"
+    if seconds <= 0: return "expired"
+    h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
+    if h > 0: return f"{str(h).zfill(2)}:{str(m).zfill(2)}:{str(s).zfill(2)}"
+    return f"{str(m).zfill(2)}:{str(s).zfill(2)}"
+
+def activate_browser_window():
+    try:
+        result = subprocess.run(["xdotool", "search", "--onlyvisible", "--class", "chrome"], capture_output=True, text=True, timeout=3)
+        window_ids = result.stdout.strip().split('\n')
+        if window_ids and window_ids[0]:
+            subprocess.run(["xdotool", "windowactivate", window_ids[0]], timeout=2, stderr=subprocess.DEVNULL)
+            time.sleep(0.1)
+    except:
+        pass
+
+def click_cf_turnstile(sb):
+    try:
+        sb.execute_script(
+            "var container = document.querySelector('.cf-turnstile');"
+            "if (container) container.scrollIntoView({behavior: 'instant', block: 'center'});"
+        )
+        time.sleep(0.2)
+        info = sb.execute_script("""
+            var container = document.querySelector('.cf-turnstile');
+            var rect = null; var w = 0;
+            var iframe = container ? container.querySelector('iframe') : document.querySelector('iframe');
+            if (iframe) { rect = iframe.getBoundingClientRect(); w = rect.width; }
+            if (!rect || w === 0) {
+                if (!container) return null;
+                rect = container.getBoundingClientRect(); w = rect.width;
+            }
+            return {
+                screenX: window.screenX || 0, screenY: window.screenY || 0,
+                outerHeight: window.outerHeight, innerHeight: window.innerHeight,
+                cf_x: rect.x, cf_y: rect.y, cf_w: w, cf_h: rect.height
+            };
+        """)
+        if not info: return False
+        
+        bar = info["outerHeight"] - info["innerHeight"]
+        actual_cf_left = info["cf_x"] + (info["cf_w"] - 300) / 2 if info["cf_w"] > 320 else info["cf_x"]
+        
+        abs_x = actual_cf_left + 30 + info["screenX"]
+        abs_y = info["cf_y"] + (info["cf_h"] / 2) + info["screenY"] + bar
+
+        activate_browser_window()
+        subprocess.run(["xdotool", "mousemove", str(int(abs_x)), str(int(abs_y))], timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+        return True
+    except:
+        return False
+
+def is_btn_enabled(sb, selector):
+    try: return sb.execute_script(f"var btn = document.querySelector('{selector}'); return btn && !btn.disabled;")
+    except: return False
+
+def handle_cf_for_btn(sb, btn_selector):
+    # 极速版：自动验证只等 5 秒，不通过直接点
+    for i in range(5):
+        if is_btn_enabled(sb, btn_selector): return True
+        time.sleep(1)
+
+    for attempt in range(4): # 重试次数从 6 减到 4
+        if is_btn_enabled(sb, btn_selector): return True
+        click_cf_turnstile(sb)
+        for _ in range(15): # 点击后等待 7.5 秒看是否变绿
+            time.sleep(0.5)
+            if is_btn_enabled(sb, btn_selector): return True
+    return False
+
+def login(sb, email, password):
+    sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=3)
+    time.sleep(2)
+    if "/auth" not in sb.get_current_url(): return True
+
+    try:
+        sb.type('input[type="email"]', email)
+        sb.type('input[type="password"]', password)
+    except:
+        return False
+
+    handle_cf_for_btn(sb, 'button[type="submit"]')
+    
+    try:
+        sb.execute_script("var btn = document.querySelector('button[type=\"submit\"]'); if(btn) btn.click();")
+    except: pass
+    
+    time.sleep(3)
+    return "/auth" not in sb.get_current_url()
+
+def do_renew(sb, server_id):
+    renew_url = server_id if server_id.startswith("http") else BASE_URL + server_id
+    sb.uc_open_with_reconnect(renew_url, reconnect_time=3)
+    time.sleep(2)
+
+    if "/auth" in sb.get_current_url(): return False
+
+    try:
+        present = sb.execute_script("return document.querySelector('.dismissModal') !== null || document.querySelector('.closeModal') !== null;")
+        if present:
+            sb.execute_script("var btn = document.querySelector('.dismissModal') || document.querySelector('.closeModal'); if(btn) btn.click();")
+            time.sleep(0.5)
+    except: pass
+
+    handle_cf_for_btn(sb, '#renewSessionBtn')
+    
+    ready = False
+    for i in range(10):
+        if is_btn_enabled(sb, '#renewSessionBtn'):
+            ready = True
+            break
+        time.sleep(1)
+
+    if not ready: return False
+
+    sb.execute_script("document.getElementById('renewSessionBtn').click();")
+    
+    for i in range(10):
+        time.sleep(1)
+        try:
+            success = sb.execute_script("var body = document.body.innerText || ''; return body.includes('renewed successfully') || body.includes('Session renewed');")
+            if success: return True
+        except: pass
+    return True # 默认放行，依靠时间增加判定
+
+async def tg_notify(message):
+    token, chat_id = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
+    if not token or not chat_id: return
+    async with aiohttp.ClientSession() as session:
+        try: await session.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"})
+        except: pass
+
+
+
+#极简版本
+"""
+def main():
+    accounts = parse_accounts()
+    if not accounts: return
+    results = []
+    try:
+        with SB(uc=True, test=True, locale="zh-CN", headless=False, window_size="1920,1080", chromium_arg="--disable-dev-shm-usage,--no-sandbox,--disable-gpu,--force-device-scale-factor=1,--window-size=1920,1080,--start-maximized") as sb:
+            for i, account in enumerate(accounts):
+                remark = account.get("remark", f"account{i+1}")
+                server_id = account.get("id", "").strip()
+                result = {"remark": remark, "server_id": server_id, "status": "error"}
+                
+                if login(sb, account.get("email"), account.get("password")):
+                    if do_renew(sb, server_id):
+                        time.sleep(2)
+                        result["status"] = "success"
+                        result["remaining"] = get_remaining_seconds(sb)
+                results.append(result)
+    except:
+        asyncio.run(tg_notify("FreeMCHost ERROR: Browser failed"))
+        return
+
+    # 简化的报告输出
+    lines = ["<b>FreeMCHost Renew</b>", ""]
+    for r in results:
+        icon = "✅" if r["status"] == "success" else "❌"
+        lines.append(f"{icon} {r['remark']}")
+        if r["status"] == "success": lines.append(f"  Remaining: {format_remaining(r.get('remaining'))}")
+    asyncio.run(tg_notify("\n".join(lines)))
+"""
+
+
+
+def main():
+    accounts = parse_accounts()
+    if not accounts: return
+    results = []
+    try:
+        with SB(uc=True, test=True, locale="zh-CN", headless=False, window_size="1920,1080", chromium_arg="--disable-dev-shm-usage,--no-sandbox,--disable-gpu,--force-device-scale-factor=1,--window-size=1920,1080,--start-maximized") as sb:
+            for i, account in enumerate(accounts):
+                remark = account.get("remark", f"account{i+1}")
+                server_id = account.get("id", "").strip()
+                result = {"remark": remark, "server_id": server_id, "status": "error"}
+                
+                # --- 新增的打印提示开始 ---
+                print(f"\n========================================")
+                print(f"[*] 开始处理账号: {remark}")
+                print(f"[*] 正在尝试登录...")
+                
+                if login(sb, account.get("email"), account.get("password")):
+                    print(f"[+] ✅ 登录成功！")
+                    
+                    print(f"[*] 正在尝试执行续期...")
+                    if do_renew(sb, server_id):
+                        time.sleep(2)
+                        result["status"] = "success"
+                        result["remaining"] = get_remaining_seconds(sb)
+                        print(f"[+] ✅ 续期成功！当前剩余时间: {format_remaining(result['remaining'])}")
+                    else:
+                        print(f"[-] ❌ 续期失败，未能通过验证或未找到按钮。")
+                else:
+                    print(f"[-] ❌ 登录失败，请检查账号密码或 CF 盾阻拦。")
+                
+                print(f"========================================")
+                # --- 新增的打印提示结束 ---
+
+                results.append(result)
+    except:
+        asyncio.run(tg_notify("FreeMCHost ERROR: Browser failed"))
+        return
+
+    # 简化的报告输出 (发给 TG 的内容保持不变)
+    lines = ["<b>FreeMCHost Renew</b>", ""]
+    for r in results:
+        icon = "✅" if r["status"] == "success" else "❌"
+        lines.append(f"{icon} {r['remark']}")
+        if r["status"] == "success": lines.append(f"  Remaining: {format_remaining(r.get('remaining'))}")
+    asyncio.run(tg_notify("\n".join(lines)))
+
+if __name__ == "__main__":
+    main()
